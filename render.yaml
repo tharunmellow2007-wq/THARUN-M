@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: parkinsons-detection
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run parkinsons_detection_render.py --server.port $PORT --server.address 0.0.0.0
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.0
+      - key: MODEL_DIR
+        value: ./models
