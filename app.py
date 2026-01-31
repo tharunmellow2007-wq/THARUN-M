@@ -13,15 +13,17 @@ import gradio as gr
 from datetime import datetime
 from PIL import Image
 import warnings
+import threading
+import time
 warnings.filterwarnings('ignore')
 
 """
 Professional Parkinson's Disease Detection System
-Medical-Grade App Interface with Advanced Voice Analysis
+OPTIMIZED FOR RENDER DEPLOYMENT - Fixed Version
 """
 
 print("="*80)
-print("PARKINSON'S DISEASE DETECTION - PROFESSIONAL MEDICAL APP")
+print("PARKINSON'S DISEASE DETECTION - STARTING")
 print("="*80)
 
 # ============================================================================
@@ -36,6 +38,38 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # Global state management
 current_features = None
 current_prediction = None
+
+# LAZY LOADING - Models loaded on first use, not at startup
+model = None
+scaler = None
+feature_info = None
+images_cache = {}
+
+# ============================================================================
+# LAZY MODEL LOADER (Critical for Render)
+# ============================================================================
+
+def load_model_components():
+    """Load model components ONLY when needed (lazy loading)"""
+    global model, scaler, feature_info
+    
+    if model is not None:
+        return model, scaler, feature_info
+    
+    print("⏳ Loading model components...")
+    try:
+        with open(f'{MODEL_DIR}/parkinsons_ensemble_model.pkl', 'rb') as f:
+            model = pickle.load(f)
+        with open(f'{MODEL_DIR}/feature_scaler.pkl', 'rb') as f:
+            scaler = pickle.load(f)
+        with open(f'{MODEL_DIR}/feature_info.json', 'r') as f:
+            feature_info = json.load(f)
+        print("✓ Model loaded successfully!")
+        return model, scaler, feature_info
+    except Exception as e:
+        print(f"⚠️ Error loading model: {e}")
+        print("⚠️ Running in demo mode without actual model")
+        return None, None, None
 
 # ============================================================================
 # PREPROCESSING FUNCTIONS
@@ -127,6 +161,8 @@ def preprocess_parkinsons_audio(audio_path=None, audio_data=None, sr=None,
                                 noise_reduction_strength='medium',
                                 preserve_parkinsons_features=True):
     """Comprehensive audio preprocessing for Parkinson's voice analysis"""
+    print("🎵 Preprocessing audio...")
+    
     if audio_path:
         y, original_sr = librosa.load(audio_path, sr=None, mono=True)
     elif audio_data:
@@ -160,14 +196,16 @@ def preprocess_parkinsons_audio(audio_path=None, audio_data=None, sr=None,
         'sample_rate': target_sr
     }
 
+    print("✓ Preprocessing complete")
     return y, target_sr, quality_metrics
 
 # ============================================================================
-# FEATURE EXTRACTION FUNCTIONS
+# FEATURE EXTRACTION FUNCTIONS WITH TIMEOUT PROTECTION
 # ============================================================================
 
 def extract_jitter_shimmer_features(voice):
     """Extract jitter and shimmer features using Parselmouth"""
+    print("📊 Extracting jitter/shimmer...")
     try:
         point_process = call(voice, "To PointProcess (periodic, cc)", 75, 600)
 
@@ -183,6 +221,7 @@ def extract_jitter_shimmer_features(voice):
         shimmer_apq11 = call([voice, point_process], "Get shimmer (apq11)", 0, 0, 0.0001, 0.02, 1.3, 1.6)
         shimmer_dda = shimmer_apq3 * 3
 
+        print("✓ Jitter/shimmer extracted")
         return {
             'Jitter(%)': jitter_percent,
             'Jitter:RAP': jitter_rap,
@@ -200,11 +239,13 @@ def extract_jitter_shimmer_features(voice):
 
 def extract_harmonicity_features(voice):
     """Extract NHR and HNR features"""
+    print("🎵 Extracting harmonicity...")
     try:
         harmonicity = call(voice, "To Harmonicity (cc)", 0.01, 75, 0.1, 1.0)
         hnr = call(harmonicity, "Get mean", 0, 0)
         nhr = 1.0 / (hnr + 1e-6) if hnr > 0 else 1.0
 
+        print("✓ Harmonicity extracted")
         return {
             'NHR': nhr,
             'HNR': hnr
@@ -214,6 +255,7 @@ def extract_harmonicity_features(voice):
 
 def extract_nonlinear_features(y, sr):
     """Extract RPDE, DFA, and PPE features"""
+    print("🔬 Extracting nonlinear features...")
     try:
         spec = np.abs(librosa.stft(y))
         spec_norm = spec / (np.sum(spec, axis=0) + 1e-6)
@@ -227,6 +269,7 @@ def extract_nonlinear_features(y, sr):
         f0_valid = f0[f0 > 0]
         ppe = np.std(f0_valid) / (np.mean(f0_valid) + 1e-6) if len(f0_valid) > 0 else 0.0
 
+        print("✓ Nonlinear features extracted")
         return {
             'RPDE': rpde,
             'DFA': dfa,
@@ -236,7 +279,8 @@ def extract_nonlinear_features(y, sr):
         raise Exception(f"Error extracting nonlinear features: {e}")
 
 def extract_all_features(audio_path=None, audio_data=None, sr=None):
-    """Extract all 15 required features"""
+    """Extract all 15 required features with progress tracking"""
+    print("🔬 Starting feature extraction...")
     try:
         if audio_path:
             audio_array, sample_rate = librosa.load(audio_path, sr=sr, mono=True)
@@ -251,6 +295,7 @@ def extract_all_features(audio_path=None, audio_data=None, sr=None):
         else:
             raise ValueError("Either audio_path or audio_data must be provided")
 
+        # Extract features sequentially with progress
         jitter_shimmer = extract_jitter_shimmer_features(voice)
         harmonicity = extract_harmonicity_features(voice)
         nonlinear = extract_nonlinear_features(audio_array, sample_rate)
@@ -266,9 +311,11 @@ def extract_all_features(audio_path=None, audio_data=None, sr=None):
             **nonlinear
         }
 
+        print("✓ All features extracted successfully")
         return all_features
 
     except Exception as e:
+        print(f"❌ Feature extraction failed: {e}")
         raise Exception(f"Feature extraction failed: {e}")
 
 # ============================================================================
@@ -277,6 +324,7 @@ def extract_all_features(audio_path=None, audio_data=None, sr=None):
 
 def classify_parkinsons_stage_weighted(features):
     """15-feature weighted voting stage classification"""
+    print("📈 Classifying stage...")
 
     weights = {
         'NHR': 5, 'HNR': 5, 'RPDE': 5,
@@ -449,6 +497,7 @@ def classify_parkinsons_stage_weighted(features):
         }
     }
 
+    print(f"✓ Stage classified: Stage {predicted_stage}")
     return {
         'stage': predicted_stage,
         'stage_name': stage_info[predicted_stage]['name'],
@@ -466,33 +515,16 @@ def classify_parkinsons_stage_weighted(features):
     }
 
 # ============================================================================
-# LOAD MODEL
-# ============================================================================
-
-def load_model_components():
-    """Load model, scaler, and feature info"""
-    try:
-        with open(f'{MODEL_DIR}/parkinsons_ensemble_model.pkl', 'rb') as f:
-            model = pickle.load(f)
-        with open(f'{MODEL_DIR}/feature_scaler.pkl', 'rb') as f:
-            scaler = pickle.load(f)
-        with open(f'{MODEL_DIR}/feature_info.json', 'r') as f:
-            feature_info = json.load(f)
-        print("✓ Model loaded successfully!")
-        return model, scaler, feature_info
-    except Exception as e:
-        print(f"⚠️ Error loading model: {e}")
-        print("⚠️ Running in demo mode without actual model")
-        return None, None, None
-
-model, scaler, feature_info = load_model_components()
-
-# ============================================================================
-# IMAGE LOADING FUNCTION
+# IMAGE LOADING FUNCTION (LAZY)
 # ============================================================================
 
 def load_stage_images(stage):
-    """Load images for a given stage"""
+    """Load images for a given stage (cached)"""
+    global images_cache
+    
+    if stage in images_cache:
+        return images_cache[stage]
+    
     images = []
 
     for suffix in ['a', 'b']:
@@ -507,12 +539,15 @@ def load_stage_images(stage):
                     print(f"✗ Failed to load: stage{stage}{suffix}.{ext} - {e}")
 
     if len(images) >= 2:
-        return images[0], images[1]
+        result = (images[0], images[1])
     elif len(images) == 1:
-        return images[0], None
+        result = (images[0], None)
     else:
         print(f"⚠️ No images found for stage {stage}")
-        return None, None
+        result = (None, None)
+    
+    images_cache[stage] = result
+    return result
 
 # ============================================================================
 # GRADIO INTERFACE FUNCTIONS
@@ -521,6 +556,10 @@ def load_stage_images(stage):
 def detect_disease(audio_input, noise_reduction):
     """Disease detection from microphone or upload"""
     global current_features, current_prediction
+    
+    print("\n" + "="*60)
+    print("🔬 DISEASE DETECTION STARTED")
+    print("="*60)
 
     try:
         if audio_input is None:
@@ -536,8 +575,24 @@ def detect_disease(audio_input, noise_reduction):
             """, None
 
         # Handle different input types
+        print("📥 Processing audio input...")
         if isinstance(audio_input, tuple):
             sr, audio_array = audio_input
+            
+            # Validate audio length (CRITICAL for Render)
+            duration = len(audio_array) / sr
+            if duration > 15:
+                return """
+                <div style="background: #fee2e2; padding: 35px; border-radius: 20px;">
+                    <h2 style="color: #991b1b;">⚠️ Audio Too Long</h2>
+                    <p style="color: #7f1d1d; font-size: 1.1em;">
+                        Maximum duration: 15 seconds<br>
+                        Your audio: {:.1f} seconds<br><br>
+                        Please record a shorter sample.
+                    </p>
+                </div>
+                """.format(duration), None
+            
             audio_array = audio_array.astype(np.float32) / 32768.0
 
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -556,23 +611,47 @@ def detect_disease(audio_input, noise_reduction):
         else:
             temp_path = audio_input
             audio_source = "Uploaded File"
-
+            
+            # Validate file size
             audio_array, sample_rate = librosa.load(temp_path, sr=None, mono=True)
+            duration = len(audio_array) / sample_rate
+            
+            if duration > 15:
+                return """
+                <div style="background: #fee2e2; padding: 35px; border-radius: 20px;">
+                    <h2 style="color: #991b1b;">⚠️ Audio Too Long</h2>
+                    <p style="color: #7f1d1d; font-size: 1.1em;">
+                        Maximum duration: 15 seconds<br>
+                        Your audio: {:.1f} seconds<br><br>
+                        Please upload a shorter file.
+                    </p>
+                </div>
+                """.format(duration), None
+
             quality_metrics = {
-                'duration': len(audio_array) / sample_rate,
+                'duration': duration,
                 'sample_rate': sample_rate
             }
 
             features = extract_all_features(audio_path=temp_path)
 
+        print("✓ Features extracted successfully")
+
+        # Load model (lazy loading)
+        print("🔧 Loading model...")
+        m, s, fi = load_model_components()
+        
         # Disease prediction
-        if model is not None and scaler is not None and feature_info is not None:
-            feature_vector = [features[name] for name in feature_info['feature_names']]
-            feature_scaled = scaler.transform([feature_vector])
-            prediction = model.predict(feature_scaled)[0]
+        if m is not None and s is not None and fi is not None:
+            print("🤖 Running prediction...")
+            feature_vector = [features[name] for name in fi['feature_names']]
+            feature_scaled = s.transform([feature_vector])
+            prediction = m.predict(feature_scaled)[0]
+            print(f"✓ Prediction: {'Parkinson\'s' if prediction == 1 else 'Healthy'}")
         else:
             # Demo mode - use simple heuristic
             prediction = 1 if features['Jitter(%)'] > 0.006 else 0
+            print(f"⚠️ Demo mode prediction: {'Parkinson\'s' if prediction == 1 else 'Healthy'}")
 
         # Store globally for Tab 2
         current_features = features
@@ -688,9 +767,13 @@ def detect_disease(audio_input, noise_reduction):
         features_df.index.name = 'Feature'
         features_df = features_df.round(6)
 
+        print("✓ Disease detection complete")
+        print("="*60 + "\n")
         return result_html, features_df
 
     except Exception as e:
+        print(f"❌ ERROR: {str(e)}")
+        print("="*60 + "\n")
         error_msg = f"""
         <div style="background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%); padding: 35px; border-radius: 20px; box-shadow: 0 8px 20px rgba(220,38,38,0.2);">
             <div style="display: flex; align-items: center; margin-bottom: 20px;">
@@ -706,7 +789,7 @@ def detect_disease(audio_input, noise_reduction):
                     <strong>Error Details:</strong> {str(e)}
                     <br><br>
                     <strong>Troubleshooting Tips:</strong>
-                    <br>• Ensure audio is clear and at least 3-5 seconds long
+                    <br>• Ensure audio is clear and 3-15 seconds long
                     <br>• Check microphone is working properly
                     <br>• Verify file format (WAV, MP3, FLAC supported)
                     <br>• Ensure sufficient voice activity in recording
@@ -720,6 +803,10 @@ def detect_disease(audio_input, noise_reduction):
 def classify_stage(audio_input):
     """Stage classification with images shown first"""
     global current_features, current_prediction
+    
+    print("\n" + "="*60)
+    print("📈 STAGE CLASSIFICATION STARTED")
+    print("="*60)
 
     try:
         if audio_input is None:
@@ -775,6 +862,7 @@ def classify_stage(audio_input):
         stage_result = classify_parkinsons_stage_weighted(current_features)
 
         # Load images FIRST
+        print(f"🖼️ Loading images for stage {stage_result['stage']}...")
         stage_img1, stage_img2 = load_stage_images(stage_result['stage'])
 
         # Build comprehensive stage output
@@ -880,9 +968,13 @@ def classify_stage(audio_input):
 
         contrib_df = pd.DataFrame(contrib_data)
 
+        print("✓ Stage classification complete")
+        print("="*60 + "\n")
         return stage_html, contrib_df, stage_img1, stage_img2
 
     except Exception as e:
+        print(f"❌ ERROR: {str(e)}")
+        print("="*60 + "\n")
         error_msg = f"""
         <div style="background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%); padding: 35px; border-radius: 20px; box-shadow: 0 8px 20px rgba(220,38,38,0.2);">
             <div style="display: flex; align-items: center; margin-bottom: 20px;">
@@ -910,6 +1002,8 @@ def clear_all():
     global current_features, current_prediction
     current_features = None
     current_prediction = None
+    
+    print("🔄 Cleared all data")
 
     ready_msg = """
     <div style="text-align: center; padding: 80px 30px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.2);">
@@ -946,6 +1040,8 @@ def clear_all():
 # ============================================================================
 # CREATE PROFESSIONAL APP INTERFACE
 # ============================================================================
+
+print("🎨 Building Gradio interface...")
 
 custom_css = """
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
@@ -1052,7 +1148,7 @@ with gr.Blocks(title="Parkinson's Disease Detection System", theme=gr.themes.Sof
                         <strong style="color: #92400e; font-size: 1.1em;">🎙️ Recording Guidelines:</strong>
                         <ul style="margin: 10px 0 0 0; padding-left: 25px; color: #78350f; line-height: 1.9;">
                             <li><strong>Environment:</strong> Find a quiet location without background noise</li>
-                            <li><strong>Duration:</strong> Speak clearly for 5-10 seconds</li>
+                            <li><strong>Duration:</strong> Speak clearly for 5-10 seconds (max 15 seconds)</li>
                             <li><strong>Task:</strong> Sustain a vowel sound (e.g., "Aaaah") or count from 1-10</li>
                             <li><strong>Volume:</strong> Maintain consistent, comfortable speaking volume</li>
                             <li><strong>Formats:</strong> WAV, MP3, FLAC supported | Best: 16kHz+ sample rate</li>
@@ -1246,66 +1342,17 @@ with gr.Blocks(title="Parkinson's Disease Detection System", theme=gr.themes.Sof
 # LAUNCH INTERFACE
 # ============================================================================
 
-with gr.Blocks(title="Parkinson's Disease Detection System") as demo:
-    gr.Markdown("""
-    # 🧠 Parkinson's Disease Detection System
-    ### Medical-grade voice analysis and stage classification
-    """)
+print("✓ Gradio interface built successfully")
+print("="*80)
 
-    with gr.Tabs():
-        # ---------------- TAB 1 ----------------
-        with gr.Tab("Disease Detection"):
-            audio_input = gr.Audio(
-                sources=["microphone", "upload"],
-                type="numpy",
-                label="Record or Upload Voice Sample"
-            )
-
-            noise_reduction = gr.Radio(
-                ["light", "medium", "heavy"],
-                value="medium",
-                label="Noise Reduction Strength"
-            )
-
-            analyze_btn = gr.Button("🔍 Analyze Voice", variant="primary")
-            result_html = gr.HTML()
-            features_table = gr.Dataframe(
-                label="Extracted Voice Features",
-                interactive=False
-            )
-
-            analyze_btn.click(
-                detect_disease,
-                inputs=[audio_input, noise_reduction],
-                outputs=[result_html, features_table]
-            )
-
-        # ---------------- TAB 2 ----------------
-        with gr.Tab("Stage Classification"):
-            stage_btn = gr.Button("📊 Classify Stage", variant="primary")
-
-            stage_html = gr.HTML()
-            contrib_table = gr.Dataframe(label="Feature Contributions")
-            img1 = gr.Image(label="Stage Image 1")
-            img2 = gr.Image(label="Stage Image 2")
-
-            stage_btn.click(
-                classify_stage,
-                inputs=[audio_input],
-                outputs=[stage_html, contrib_table, img1, img2]
-            )
-
-        # ---------------- TAB 3 ----------------
-        with gr.Tab("Reset"):
-            reset_btn = gr.Button("♻️ Clear All")
-            reset_btn.click(clear_all)
-
-# ---------------- LAUNCH (RENDER REQUIRED) ----------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
+    print(f"🚀 Launching on port {port}...")
+    print("="*80)
+    
     demo.launch(
         server_name="0.0.0.0",
         server_port=port,
-        show_error=True
+        show_error=True,
+        share=False
     )
-
