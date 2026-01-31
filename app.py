@@ -647,11 +647,13 @@ def detect_disease(audio_input, noise_reduction):
             feature_vector = [features[name] for name in fi['feature_names']]
             feature_scaled = s.transform([feature_vector])
             prediction = m.predict(feature_scaled)[0]
-            print(f"✓ Prediction: {'Parkinson\'s' if prediction == 1 else 'Healthy'}")
+            result_name = "Parkinson's" if prediction == 1 else "Healthy"
+            print(f"✓ Prediction: {result_name}")
         else:
             # Demo mode - use simple heuristic
             prediction = 1 if features['Jitter(%)'] > 0.006 else 0
-            print(f"⚠️ Demo mode prediction: {'Parkinson\'s' if prediction == 1 else 'Healthy'}")
+            result_name = "Parkinson's" if prediction == 1 else "Healthy"
+            print(f"⚠️ Demo mode prediction: {result_name}")
 
         # Store globally for Tab 2
         current_features = features
