@@ -1246,24 +1246,66 @@ with gr.Blocks(title="Parkinson's Disease Detection System", theme=gr.themes.Sof
 # LAUNCH INTERFACE
 # ============================================================================
 
-if __name__ == "__main__":
-    print("\n" + "="*80)
-    print("LAUNCHING PROFESSIONAL MEDICAL APP INTERFACE")
-    print("="*80)
-    print("\n🚀 Starting Parkinson's Disease Detection System...")
-    print("📊 Professional Two-Tab Interface")
-    print("🎯 Tab 1: Disease Detection with Microphone Input")
-    print("📈 Tab 2: Stage Classification (Images First)")
-    print("\n" + "="*80)
+with gr.Blocks(title="Parkinson's Disease Detection System") as demo:
+    gr.Markdown("""
+    # 🧠 Parkinson's Disease Detection System
+    ### Medical-grade voice analysis and stage classification
+    """)
 
+    with gr.Tabs():
+        # ---------------- TAB 1 ----------------
+        with gr.Tab("Disease Detection"):
+            audio_input = gr.Audio(
+                sources=["microphone", "upload"],
+                type="numpy",
+                label="Record or Upload Voice Sample"
+            )
+
+            noise_reduction = gr.Radio(
+                ["light", "medium", "heavy"],
+                value="medium",
+                label="Noise Reduction Strength"
+            )
+
+            analyze_btn = gr.Button("🔍 Analyze Voice", variant="primary")
+            result_html = gr.HTML()
+            features_table = gr.Dataframe(
+                label="Extracted Voice Features",
+                interactive=False
+            )
+
+            analyze_btn.click(
+                detect_disease,
+                inputs=[audio_input, noise_reduction],
+                outputs=[result_html, features_table]
+            )
+
+        # ---------------- TAB 2 ----------------
+        with gr.Tab("Stage Classification"):
+            stage_btn = gr.Button("📊 Classify Stage", variant="primary")
+
+            stage_html = gr.HTML()
+            contrib_table = gr.Dataframe(label="Feature Contributions")
+            img1 = gr.Image(label="Stage Image 1")
+            img2 = gr.Image(label="Stage Image 2")
+
+            stage_btn.click(
+                classify_stage,
+                inputs=[audio_input],
+                outputs=[stage_html, contrib_table, img1, img2]
+            )
+
+        # ---------------- TAB 3 ----------------
+        with gr.Tab("Reset"):
+            reset_btn = gr.Button("♻️ Clear All")
+            reset_btn.click(clear_all)
+
+# ---------------- LAUNCH (RENDER REQUIRED) ----------------
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 7860))
     demo.launch(
-        share=False,
         server_name="0.0.0.0",
-        server_port=7860,
-        show_error=True,
-        debug=False,
-        quiet=False
+        server_port=port,
+        show_error=True
     )
 
-    print("\n✅ Interface launched successfully!")
-    print("📱 Access at http://localhost:7860")
