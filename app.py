@@ -13,8 +13,6 @@ import gradio as gr
 from datetime import datetime
 from PIL import Image
 import warnings
-import threading
-import time
 warnings.filterwarnings('ignore')
 
 """
@@ -157,22 +155,17 @@ def trim_silence(audio, sr, top_db=20):
     trimmed_audio = np.concatenate(trimmed_audio)
     return trimmed_audio, intervals
 
-def preprocess_parkinsons_audio(audio_path=None, audio_data=None, sr=None,
+def preprocess_parkinsons_audio(audio_data, sr,
                                 noise_reduction_strength='medium',
                                 preserve_parkinsons_features=True):
-    """Comprehensive audio preprocessing for Parkinson's voice analysis"""
+    """
+    Comprehensive audio preprocessing for Parkinson's voice analysis.
+    Now takes (audio_array, sr) directly — no file path needed.
+    """
     print("🎵 Preprocessing audio...")
     
-    if audio_path:
-        y, original_sr = librosa.load(audio_path, sr=None, mono=True)
-    elif audio_data:
-        y, original_sr = audio_data
-    else:
-        raise ValueError("Either audio_path or audio_data must be provided")
-
-    target_sr = sr if sr else 16000
-    if original_sr != target_sr:
-        y = librosa.resample(y, orig_sr=original_sr, target_sr=target_sr)
+    y = audio_data.copy().astype(np.float32)
+    target_sr = sr
 
     y = remove_dc_offset(y)
     noise_profile = estimate_noise_profile(y, target_sr)
@@ -200,7 +193,7 @@ def preprocess_parkinsons_audio(audio_path=None, audio_data=None, sr=None,
     return y, target_sr, quality_metrics
 
 # ============================================================================
-# FEATURE EXTRACTION FUNCTIONS WITH TIMEOUT PROTECTION
+# FEATURE EXTRACTION FUNCTIONS
 # ============================================================================
 
 def extract_jitter_shimmer_features(voice):
@@ -278,32 +271,25 @@ def extract_nonlinear_features(y, sr):
     except Exception as e:
         raise Exception(f"Error extracting nonlinear features: {e}")
 
-def extract_all_features(audio_path=None, audio_data=None, sr=None):
-    """Extract all 15 required features with progress tracking"""
+def extract_all_features(audio_array, sample_rate):
+    """
+    Extract all 15 required features.
+    Takes a float32 numpy array and its sample rate directly.
+    Writes a single clean WAV for Parselmouth, then cleans up.
+    """
     print("🔬 Starting feature extraction...")
+    temp_wav = '/tmp/temp_parselmouth.wav'
     try:
-        if audio_path:
-            audio_array, sample_rate = librosa.load(audio_path, sr=sr, mono=True)
-            temp_wav = '/tmp/temp_audio.wav'
-            sf.write(temp_wav, audio_array, sample_rate)
-            voice = parselmouth.Sound(temp_wav)
-        elif audio_data:
-            audio_array, sample_rate = audio_data
-            temp_wav = '/tmp/temp_audio.wav'
-            sf.write(temp_wav, audio_array, sample_rate)
-            voice = parselmouth.Sound(temp_wav)
-        else:
-            raise ValueError("Either audio_path or audio_data must be provided")
+        # Write float32 audio as 16-bit PCM WAV for Parselmouth compatibility
+        audio_int16 = np.clip(audio_array * 32767, -32768, 32767).astype(np.int16)
+        sf.write(temp_wav, audio_int16, sample_rate, subtype='PCM_16')
+        
+        voice = parselmouth.Sound(temp_wav)
 
-        # Extract features sequentially with progress
+        # Extract features sequentially
         jitter_shimmer = extract_jitter_shimmer_features(voice)
         harmonicity = extract_harmonicity_features(voice)
         nonlinear = extract_nonlinear_features(audio_array, sample_rate)
-
-        try:
-            os.remove(temp_wav)
-        except:
-            pass
 
         all_features = {
             **jitter_shimmer,
@@ -317,6 +303,13 @@ def extract_all_features(audio_path=None, audio_data=None, sr=None):
     except Exception as e:
         print(f"❌ Feature extraction failed: {e}")
         raise Exception(f"Feature extraction failed: {e}")
+    finally:
+        # Always clean up the temp file
+        try:
+            if os.path.exists(temp_wav):
+                os.remove(temp_wav)
+        except:
+            pass
 
 # ============================================================================
 # STAGE CLASSIFICATION
@@ -550,6 +543,43 @@ def load_stage_images(stage):
     return result
 
 # ============================================================================
+# HELPER: PARSE AUDIO INPUT FROM GRADIO
+# ============================================================================
+
+def parse_audio_input(audio_input):
+    """
+    Gradio gr.Audio with type="numpy" returns (sample_rate: int, data: np.ndarray).
+    data is int16. This helper normalises it to float32 in [-1, 1].
+    Returns (float32_array, sample_rate) or raises on bad input.
+    """
+    if audio_input is None:
+        raise ValueError("No audio provided")
+
+    if not isinstance(audio_input, tuple) or len(audio_input) != 2:
+        raise ValueError(
+            f"Unexpected audio format: {type(audio_input)}. "
+            "Expected a (sample_rate, numpy_array) tuple from gr.Audio(type='numpy')."
+        )
+
+    sr, data = audio_input
+
+    if data is None or len(data) == 0:
+        raise ValueError("Audio array is empty")
+
+    # Ensure float32
+    if np.issubdtype(data.dtype, np.integer):
+        # int16 from Gradio → float32
+        data = data.astype(np.float32) / 32768.0
+    else:
+        data = data.astype(np.float32)
+
+    # Mono: if stereo (2D), average channels
+    if data.ndim == 2:
+        data = np.mean(data, axis=1)
+
+    return data, int(sr)
+
+# ============================================================================
 # GRADIO INTERFACE FUNCTIONS
 # ============================================================================
 
@@ -562,6 +592,7 @@ def detect_disease(audio_input, noise_reduction):
     print("="*60)
 
     try:
+        # --- 1. Parse & validate audio -----------------------------------------
         if audio_input is None:
             return """
             <div style="text-align: center; padding: 80px 30px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.2);">
@@ -574,94 +605,73 @@ def detect_disease(audio_input, noise_reduction):
             </div>
             """, None
 
-        # Handle different input types
-        print("📥 Processing audio input...")
-        if isinstance(audio_input, tuple):
-            sr, audio_array = audio_input
-            
-            # Validate audio length (CRITICAL for Render)
-            duration = len(audio_array) / sr
-            if duration > 15:
-                return """
-                <div style="background: #fee2e2; padding: 35px; border-radius: 20px;">
-                    <h2 style="color: #991b1b;">⚠️ Audio Too Long</h2>
-                    <p style="color: #7f1d1d; font-size: 1.1em;">
-                        Maximum duration: 15 seconds<br>
-                        Your audio: {:.1f} seconds<br><br>
-                        Please record a shorter sample.
-                    </p>
-                </div>
-                """.format(duration), None
-            
-            audio_array = audio_array.astype(np.float32) / 32768.0
+        print("📥 Parsing audio input...")
+        audio_array, sr = parse_audio_input(audio_input)
 
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            temp_path = f'/tmp/recorded_{timestamp}.wav'
-            sf.write(temp_path, audio_array, sr)
-            audio_source = "Microphone Recording"
+        # --- 2. Duration check -------------------------------------------------
+        duration = len(audio_array) / sr
+        print(f"   Duration: {duration:.2f}s | SR: {sr} Hz | Samples: {len(audio_array)}")
 
-            processed_audio, sample_rate, quality_metrics = preprocess_parkinsons_audio(
-                audio_path=temp_path,
-                noise_reduction_strength=noise_reduction,
-                preserve_parkinsons_features=True
-            )
+        if duration > 15:
+            return f"""
+            <div style="background: #fee2e2; padding: 35px; border-radius: 20px;">
+                <h2 style="color: #991b1b;">⚠️ Audio Too Long</h2>
+                <p style="color: #7f1d1d; font-size: 1.1em;">
+                    Maximum duration: 15 seconds<br>
+                    Your audio: {duration:.1f} seconds<br><br>
+                    Please record a shorter sample.
+                </p>
+            </div>
+            """, None
 
-            features = extract_all_features(audio_data=(processed_audio, sample_rate))
+        if duration < 0.5:
+            return """
+            <div style="background: #fee2e2; padding: 35px; border-radius: 20px;">
+                <h2 style="color: #991b1b;">⚠️ Audio Too Short</h2>
+                <p style="color: #7f1d1d; font-size: 1.1em;">
+                    Minimum duration: 0.5 seconds<br>
+                    Please record a longer sample (3–10 seconds recommended).
+                </p>
+            </div>
+            """, None
 
-        else:
-            temp_path = audio_input
-            audio_source = "Uploaded File"
-            
-            # Validate file size
-            audio_array, sample_rate = librosa.load(temp_path, sr=None, mono=True)
-            duration = len(audio_array) / sample_rate
-            
-            if duration > 15:
-                return """
-                <div style="background: #fee2e2; padding: 35px; border-radius: 20px;">
-                    <h2 style="color: #991b1b;">⚠️ Audio Too Long</h2>
-                    <p style="color: #7f1d1d; font-size: 1.1em;">
-                        Maximum duration: 15 seconds<br>
-                        Your audio: {:.1f} seconds<br><br>
-                        Please upload a shorter file.
-                    </p>
-                </div>
-                """.format(duration), None
+        # --- 3. Preprocess -----------------------------------------------------
+        print("🔧 Preprocessing...")
+        processed_audio, sample_rate, quality_metrics = preprocess_parkinsons_audio(
+            audio_data=audio_array,
+            sr=sr,
+            noise_reduction_strength=noise_reduction,
+            preserve_parkinsons_features=True
+        )
 
-            quality_metrics = {
-                'duration': duration,
-                'sample_rate': sample_rate
-            }
-
-            features = extract_all_features(audio_path=temp_path)
-
+        # --- 4. Extract features -----------------------------------------------
+        print("🔬 Extracting features...")
+        features = extract_all_features(processed_audio, sample_rate)
         print("✓ Features extracted successfully")
+        print(f"   Features: { {k: round(v,6) for k,v in features.items()} }")
 
-        # Load model (lazy loading)
-        print("🔧 Loading model...")
+        # --- 5. Load model & predict -------------------------------------------
+        print("🤖 Loading model & predicting...")
         m, s, fi = load_model_components()
         
-        # Disease prediction
         if m is not None and s is not None and fi is not None:
-            print("🤖 Running prediction...")
             feature_vector = [features[name] for name in fi['feature_names']]
             feature_scaled = s.transform([feature_vector])
             prediction = m.predict(feature_scaled)[0]
             result_name = "Parkinson's" if prediction == 1 else "Healthy"
-            print(f"✓ Prediction: {result_name}")
+            print(f"✓ Model prediction: {result_name}")
         else:
-            # Demo mode - use simple heuristic
-            prediction = 1 if features['Jitter(%)'] > 0.006 else 0
+            # Demo / fallback heuristic
+            prediction = 1 if features.get('Jitter(%)', 0) > 0.006 else 0
             result_name = "Parkinson's" if prediction == 1 else "Healthy"
             print(f"⚠️ Demo mode prediction: {result_name}")
 
-        # Store globally for Tab 2
+        # --- 6. Store globals for stage tab ------------------------------------
         current_features = features
         current_prediction = prediction
 
-        # Build result with app-like design
+        # --- 7. Build result HTML ----------------------------------------------
         if prediction == 1:
-            # Parkinson's Detected
             result_html = f"""
             <div style="background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%); padding: 35px; border-radius: 20px; margin-bottom: 25px; box-shadow: 0 8px 20px rgba(239,68,68,0.2);">
                 <div style="display: flex; align-items: center; margin-bottom: 15px;">
@@ -712,7 +722,6 @@ def detect_disease(audio_input, noise_reduction):
             </div>
             """
         else:
-            # Healthy
             result_html = f"""
             <div style="background: linear-gradient(135deg, #d1fae5 0%, #a7f3d0 100%); padding: 35px; border-radius: 20px; margin-bottom: 25px; box-shadow: 0 8px 20px rgba(16,185,129,0.2);">
                 <div style="display: flex; align-items: center; margin-bottom: 15px;">
@@ -763,7 +772,7 @@ def detect_disease(audio_input, noise_reduction):
             </div>
             """
 
-        # Create features dataframe
+        # Features table
         features_df = pd.DataFrame([features]).T
         features_df.columns = ['Value']
         features_df.index.name = 'Feature'
@@ -774,7 +783,9 @@ def detect_disease(audio_input, noise_reduction):
         return result_html, features_df
 
     except Exception as e:
+        import traceback
         print(f"❌ ERROR: {str(e)}")
+        traceback.print_exc()
         print("="*60 + "\n")
         error_msg = f"""
         <div style="background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%); padding: 35px; border-radius: 20px; box-shadow: 0 8px 20px rgba(220,38,38,0.2);">
@@ -791,7 +802,7 @@ def detect_disease(audio_input, noise_reduction):
                     <strong>Error Details:</strong> {str(e)}
                     <br><br>
                     <strong>Troubleshooting Tips:</strong>
-                    <br>• Ensure audio is clear and 3-15 seconds long
+                    <br>• Ensure audio is clear and 3–15 seconds long
                     <br>• Check microphone is working properly
                     <br>• Verify file format (WAV, MP3, FLAC supported)
                     <br>• Ensure sufficient voice activity in recording
@@ -802,8 +813,12 @@ def detect_disease(audio_input, noise_reduction):
         return error_msg, None
 
 
-def classify_stage(audio_input):
-    """Stage classification with images shown first"""
+def classify_stage(_audio_input_unused):
+    """
+    Stage classification — triggered by .then() after detect_disease.
+    Does NOT re-process audio; reads from current_features / current_prediction globals.
+    The audio_input parameter exists only to satisfy the .then() chain signature.
+    """
     global current_features, current_prediction
     
     print("\n" + "="*60)
@@ -811,19 +826,7 @@ def classify_stage(audio_input):
     print("="*60)
 
     try:
-        if audio_input is None:
-            return """
-            <div style="text-align: center; padding: 80px 30px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.2);">
-                <div style="background: rgba(255,255,255,0.95); padding: 40px; border-radius: 15px; display: inline-block;">
-                    <h2 style="color: #667eea; margin: 0 0 20px 0; font-size: 2em;">ℹ️ No Audio Input</h2>
-                    <p style="color: #666; font-size: 1.2em; margin: 0; line-height: 1.6;">
-                        Please complete disease detection<br>in the first tab before proceeding
-                    </p>
-                </div>
-            </div>
-            """, None, None, None
-
-        if current_prediction is None:
+        if current_prediction is None or current_features is None:
             return """
             <div style="text-align: center; padding: 80px 30px; background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%); border-radius: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.2);">
                 <div style="background: rgba(255,255,255,0.95); padding: 40px; border-radius: 15px; display: inline-block;">
@@ -863,7 +866,7 @@ def classify_stage(audio_input):
         # Perform stage classification
         stage_result = classify_parkinsons_stage_weighted(current_features)
 
-        # Load images FIRST
+        # Load images
         print(f"🖼️ Loading images for stage {stage_result['stage']}...")
         stage_img1, stage_img2 = load_stage_images(stage_result['stage'])
 
@@ -893,7 +896,6 @@ def classify_stage(audio_input):
             <div style="background: white; padding: 25px; border-radius: 10px;">
                 <ul style="color: #7f1d1d; font-size: 1.05em; line-height: 2; margin: 0; padding-left: 25px;">
         """
-
         for symptom in stage_result['symptoms']:
             stage_html += f"<li>{symptom}</li>\n"
 
@@ -907,7 +909,6 @@ def classify_stage(audio_input):
             <div style="background: white; padding: 25px; border-radius: 10px;">
                 <ul style="color: #1e3a8a; font-size: 1.05em; line-height: 2; margin: 0; padding-left: 25px;">
         """
-
         for char in stage_result['characteristics']:
             stage_html += f"<li>{char}</li>\n"
 
@@ -921,7 +922,6 @@ def classify_stage(audio_input):
             <div style="background: white; padding: 25px; border-radius: 10px;">
                 <ul style="color: #047857; font-size: 1.05em; line-height: 2; margin: 0; padding-left: 25px;">
         """
-
         for rec in stage_result['recommendations']:
             stage_html += f"<li>{rec}</li>\n"
 
@@ -935,7 +935,6 @@ def classify_stage(audio_input):
             <div style="background: white; padding: 25px; border-radius: 10px;">
                 <p style="color: #78350f; margin-bottom: 20px; font-size: 1.1em;"><strong>Total Weight:</strong> {stage_result['total_weight']}</p>
         """
-
         for stage, votes in sorted(stage_result['weighted_votes'].items()):
             percentage = (votes / stage_result['total_weight']) * 100
             stage_html += f"""
@@ -957,7 +956,7 @@ def classify_stage(audio_input):
         </div>
         """
 
-        # Create feature contributions dataframe
+        # Feature contributions table
         contrib_data = []
         for feat_name, contrib in sorted(stage_result['feature_contributions'].items(),
                                         key=lambda x: x[1]['weight'], reverse=True):
@@ -975,7 +974,9 @@ def classify_stage(audio_input):
         return stage_html, contrib_df, stage_img1, stage_img2
 
     except Exception as e:
+        import traceback
         print(f"❌ ERROR: {str(e)}")
+        traceback.print_exc()
         print("="*60 + "\n")
         error_msg = f"""
         <div style="background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%); padding: 35px; border-radius: 20px; box-shadow: 0 8px 20px rgba(220,38,38,0.2);">
@@ -1030,13 +1031,13 @@ def clear_all():
     """
 
     return (
-        None,  # audio_input
+        None,       # audio_input
         ready_msg,  # result_output
-        None,  # features_output
+        None,       # features_output
         stage_msg,  # stage_output
-        None,  # stage_features_output
-        None,  # stage_img1
-        None   # stage_img2
+        None,       # stage_features_output
+        None,       # stage_img1
+        None        # stage_img2
     )
 
 # ============================================================================
@@ -1214,7 +1215,6 @@ with gr.Blocks(title="Parkinson's Disease Detection System", theme=gr.themes.Sof
             </div>
             """)
 
-            # ✅ IMAGES FIRST (TOP PRIORITY)
             gr.Markdown("""
             <div style="background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%); padding: 25px; border-radius: 15px; margin: 25px 0; box-shadow: 0 4px 15px rgba(245,158,11,0.2);">
                 <h3 style="color: #92400e; margin: 0 0 10px 0; font-size: 1.5em;">🖼️ Clinical Stage Visual References</h3>
@@ -1236,7 +1236,6 @@ with gr.Blocks(title="Parkinson's Disease Detection System", theme=gr.themes.Sof
                     container=True
                 )
 
-            # ✅ THEN STAGE OUTPUT
             stage_output = gr.HTML(
                 value="""
                 <div style="text-align: center; padding: 80px 30px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.2);">
@@ -1250,7 +1249,6 @@ with gr.Blocks(title="Parkinson's Disease Detection System", theme=gr.themes.Sof
                 """
             )
 
-            # ✅ THEN ACCORDION
             with gr.Accordion("📊 Feature Contribution Analysis", open=False):
                 stage_features_output = gr.DataFrame(
                     label="Weighted Feature Contributions to Stage Prediction",
@@ -1279,14 +1277,14 @@ with gr.Blocks(title="Parkinson's Disease Detection System", theme=gr.themes.Sof
                 </div>
                 """)
 
-    # Event Handlers
+    # ========== EVENT HANDLERS ==========
     analyze_btn.click(
         fn=detect_disease,
         inputs=[audio_input, noise_reduction],
         outputs=[result_output, features_output]
     ).then(
         fn=classify_stage,
-        inputs=[audio_input],
+        inputs=[audio_input],          # passed through but not used internally
         outputs=[stage_output, stage_features_output, stage_img1, stage_img2]
     )
 
@@ -1297,7 +1295,6 @@ with gr.Blocks(title="Parkinson's Disease Detection System", theme=gr.themes.Sof
                 stage_output, stage_features_output, stage_img1, stage_img2]
     )
 
-    # Auto-reset on audio input change
     def reset_outputs():
         ready_msg = """
         <div style="text-align: center; padding: 80px 30px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.2);">
@@ -1309,7 +1306,6 @@ with gr.Blocks(title="Parkinson's Disease Detection System", theme=gr.themes.Sof
             </div>
         </div>
         """
-
         stage_msg = """
         <div style="text-align: center; padding: 80px 30px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.2);">
             <div style="background: rgba(255,255,255,0.95); padding: 40px; border-radius: 15px; display: inline-block;">
@@ -1320,7 +1316,6 @@ with gr.Blocks(title="Parkinson's Disease Detection System", theme=gr.themes.Sof
             </div>
         </div>
         """
-
         return (ready_msg, None, stage_msg, None, None, None)
 
     audio_input.change(
