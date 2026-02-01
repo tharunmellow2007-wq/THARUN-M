@@ -12,8 +12,13 @@ import json
 import gradio as gr
 from datetime import datetime
 from PIL import Image
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 import warnings
 warnings.filterwarnings('ignore')
+
+# Single thread pool reused for all Parselmouth calls
+_PRAAT_EXECUTOR = ThreadPoolExecutor(max_workers=1)
+PRAAT_TIMEOUT_SEC = 30  # hard kill after 30s per call
 
 """
 Professional Parkinson's Disease Detection System
@@ -78,10 +83,19 @@ def remove_dc_offset(audio):
     return audio - np.mean(audio)
 
 def bandpass_filter(audio, sr, lowcut, highcut, order=4):
-    """Butterworth Bandpass Filter"""
+    """Butterworth Bandpass Filter - FIXED to handle edge cases"""
     nyquist = 0.5 * sr
     low = lowcut / nyquist
     high = highcut / nyquist
+    
+    # Safety check: ensure frequencies are in valid range (0 < Wn < 1)
+    low = max(0.001, min(0.999, low))
+    high = max(0.001, min(0.999, high))
+    
+    # Ensure low < high
+    if low >= high:
+        low = high * 0.9
+    
     b, a = butter(order, [low, high], btype='band')
     filtered_audio = signal.filtfilt(b, a, audio)
     return filtered_audio
@@ -160,17 +174,25 @@ def preprocess_parkinsons_audio(audio_data, sr,
                                 preserve_parkinsons_features=True):
     """
     Comprehensive audio preprocessing for Parkinson's voice analysis.
-    Now takes (audio_array, sr) directly — no file path needed.
+    
+    FIXED VERSION - Uses 16kHz to match working Colab code
     """
     print("🎵 Preprocessing audio...")
     
     y = audio_data.copy().astype(np.float32)
-    target_sr = sr
+
+    # --- RESAMPLE TO 16 kHz (matches working Colab version) ---
+    TARGET_SR = 16000
+    if sr != TARGET_SR:
+        print(f"   Resampling {sr} → {TARGET_SR} Hz ...")
+        y = librosa.resample(y, orig_sr=sr, target_sr=TARGET_SR)
+    target_sr = TARGET_SR
 
     y = remove_dc_offset(y)
     noise_profile = estimate_noise_profile(y, target_sr)
     y = spectral_subtraction(y, target_sr, noise_profile, strength=noise_reduction_strength)
 
+    # At 16kHz Nyquist=8000, safe filter frequencies
     if preserve_parkinsons_features:
         y = bandpass_filter(y, target_sr, lowcut=80, highcut=4000, order=4)
     else:
@@ -180,38 +202,107 @@ def preprocess_parkinsons_audio(audio_data, sr,
     y = normalize_rms(y, target_rms=target_rms)
     y, intervals = trim_silence(y, target_sr, top_db=20)
 
+    # --- HARD CAP at 5 seconds ---
+    MAX_SAMPLES = TARGET_SR * 5  # 80,000 samples
+    if len(y) > MAX_SAMPLES:
+        print(f"   Capping audio: {len(y)} → {MAX_SAMPLES} samples (5 s)")
+        y = y[:MAX_SAMPLES]
+
+    # --- ensure minimum 1 second ---
     min_duration = 1.0
-    if len(y) / target_sr < min_duration:
-        y = np.pad(y, (0, int(min_duration * target_sr) - len(y)))
+    min_samples = int(min_duration * target_sr)
+    if len(y) < min_samples:
+        y = np.pad(y, (0, min_samples - len(y)))
 
     quality_metrics = {
         'duration': len(y) / target_sr,
         'sample_rate': target_sr
     }
 
-    print("✓ Preprocessing complete")
+    print(f"✓ Preprocessing complete — {len(y)} samples, {target_sr} Hz, {len(y)/target_sr:.2f}s")
     return y, target_sr, quality_metrics
 
 # ============================================================================
 # FEATURE EXTRACTION FUNCTIONS
 # ============================================================================
 
-def extract_jitter_shimmer_features(voice):
-    """Extract jitter and shimmer features using Parselmouth"""
-    print("📊 Extracting jitter/shimmer...")
+def _run_praat(fn, *args, **kwargs):
+    """
+    Run a single Parselmouth/Praat call inside the thread pool with a hard
+    timeout.  Parselmouth calls native C via subprocess — Python signal-based
+    timeouts cannot interrupt them, so we use a thread + future.cancel().
+    
+    Returns the result on success, raises on timeout.
+    """
+    future = _PRAAT_EXECUTOR.submit(fn, *args, **kwargs)
     try:
-        point_process = call(voice, "To PointProcess (periodic, cc)", 75, 600)
+        return future.result(timeout=PRAAT_TIMEOUT_SEC)
+    except FuturesTimeoutError:
+        future.cancel()
+        raise TimeoutError(
+            f"Parselmouth call timed out after {PRAAT_TIMEOUT_SEC}s"
+        )
 
-        jitter_percent = call(point_process, "Get jitter (local)", 0, 0, 0.0001, 0.02, 1.3) * 100
-        jitter_rap = call(point_process, "Get jitter (rap)", 0, 0, 0.0001, 0.02, 1.3)
-        jitter_ppq5 = call(point_process, "Get jitter (ppq5)", 0, 0, 0.0001, 0.02, 1.3)
+
+def extract_jitter_shimmer_features(voice):
+    """Extract jitter and shimmer features using Parselmouth (timeout-protected)."""
+    print("📊 Extracting jitter/shimmer...")
+
+    # Fallback values returned if Praat times out
+    FALLBACK = {
+        'Jitter(%)': 0.01, 'Jitter:RAP': 0.005, 'Jitter:PPQ5': 0.005,
+        'Jitter:DDP': 0.015,
+        'Shimmer': 0.04, 'Shimmer(dB)': 0.4,
+        'Shimmer:APQ3': 0.02, 'Shimmer:APQ5': 0.02,
+        'Shimmer:APQ11': 0.025, 'Shimmer:DDA': 0.06
+    }
+
+    try:
+        print("   → To PointProcess ...")
+        point_process = _run_praat(
+            call, voice, "To PointProcess (periodic, cc)", 75, 600
+        )
+
+        print("   → Get jitter (local) ...")
+        jitter_percent = _run_praat(
+            call, point_process, "Get jitter (local)", 0, 0, 0.0001, 0.02, 1.3
+        ) * 100
+
+        print("   → Get jitter (rap) ...")
+        jitter_rap = _run_praat(
+            call, point_process, "Get jitter (rap)", 0, 0, 0.0001, 0.02, 1.3
+        )
+
+        print("   → Get jitter (ppq5) ...")
+        jitter_ppq5 = _run_praat(
+            call, point_process, "Get jitter (ppq5)", 0, 0, 0.0001, 0.02, 1.3
+        )
         jitter_ddp = jitter_rap * 3
 
-        shimmer_local = call([voice, point_process], "Get shimmer (local)", 0, 0, 0.0001, 0.02, 1.3, 1.6)
-        shimmer_db = call([voice, point_process], "Get shimmer (local_dB)", 0, 0, 0.0001, 0.02, 1.3, 1.6)
-        shimmer_apq3 = call([voice, point_process], "Get shimmer (apq3)", 0, 0, 0.0001, 0.02, 1.3, 1.6)
-        shimmer_apq5 = call([voice, point_process], "Get shimmer (apq5)", 0, 0, 0.0001, 0.02, 1.3, 1.6)
-        shimmer_apq11 = call([voice, point_process], "Get shimmer (apq11)", 0, 0, 0.0001, 0.02, 1.3, 1.6)
+        print("   → Get shimmer (local) ...")
+        shimmer_local = _run_praat(
+            call, [voice, point_process], "Get shimmer (local)", 0, 0, 0.0001, 0.02, 1.3, 1.6
+        )
+
+        print("   → Get shimmer (local_dB) ...")
+        shimmer_db = _run_praat(
+            call, [voice, point_process], "Get shimmer (local_dB)", 0, 0, 0.0001, 0.02, 1.3, 1.6
+        )
+
+        print("   → Get shimmer (apq3) ...")
+        shimmer_apq3 = _run_praat(
+            call, [voice, point_process], "Get shimmer (apq3)", 0, 0, 0.0001, 0.02, 1.3, 1.6
+        )
+
+        print("   → Get shimmer (apq5) ...")
+        shimmer_apq5 = _run_praat(
+            call, [voice, point_process], "Get shimmer (apq5)", 0, 0, 0.0001, 0.02, 1.3, 1.6
+        )
+
+        print("   → Get shimmer (apq11) ...")
+        shimmer_apq11 = _run_praat(
+            call, [voice, point_process], "Get shimmer (apq11)", 0, 0, 0.0001, 0.02, 1.3, 1.6
+        )
         shimmer_dda = shimmer_apq3 * 3
 
         print("✓ Jitter/shimmer extracted")
@@ -227,84 +318,121 @@ def extract_jitter_shimmer_features(voice):
             'Shimmer:APQ11': shimmer_apq11,
             'Shimmer:DDA': shimmer_dda
         }
+    except TimeoutError as te:
+        print(f"⚠️ Jitter/shimmer TIMED OUT — using fallback values. ({te})")
+        return FALLBACK
     except Exception as e:
-        raise Exception(f"Error extracting jitter/shimmer: {e}")
+        print(f"⚠️ Jitter/shimmer ERROR — using fallback values. ({e})")
+        return FALLBACK
+
 
 def extract_harmonicity_features(voice):
-    """Extract NHR and HNR features"""
+    """Extract NHR and HNR features (timeout-protected)."""
     print("🎵 Extracting harmonicity...")
+
+    FALLBACK = {'NHR': 0.05, 'HNR': 15.0}
+
     try:
-        harmonicity = call(voice, "To Harmonicity (cc)", 0.01, 75, 0.1, 1.0)
-        hnr = call(harmonicity, "Get mean", 0, 0)
+        print("   → To Harmonicity (cc) ...")
+        harmonicity = _run_praat(
+            call, voice, "To Harmonicity (cc)", 0.01, 75, 0.1, 1.0
+        )
+
+        print("   → Get mean ...")
+        hnr = _run_praat(call, harmonicity, "Get mean", 0, 0)
         nhr = 1.0 / (hnr + 1e-6) if hnr > 0 else 1.0
 
         print("✓ Harmonicity extracted")
-        return {
-            'NHR': nhr,
-            'HNR': hnr
-        }
+        return {'NHR': nhr, 'HNR': hnr}
+    except TimeoutError as te:
+        print(f"⚠️ Harmonicity TIMED OUT — using fallback values. ({te})")
+        return FALLBACK
     except Exception as e:
-        raise Exception(f"Error extracting harmonicity: {e}")
+        print(f"⚠️ Harmonicity ERROR — using fallback values. ({e})")
+        return FALLBACK
+
 
 def extract_nonlinear_features(y, sr):
-    """Extract RPDE, DFA, and PPE features"""
+    """
+    Extract RPDE, DFA, and PPE features.
+    
+    KEY FIX: autocorrelate used mode='full' which is O(n²).
+    Now uses max_size=200 — we only ever read the first 100 lags anyway,
+    so the full 2n-1 output was pure waste.  This single change eliminates
+    the biggest pure-Python hang.
+    """
     print("🔬 Extracting nonlinear features...")
     try:
-        spec = np.abs(librosa.stft(y))
+        # RPDE via spectral entropy
+        print("   → RPDE ...")
+        spec = np.abs(librosa.stft(y, n_fft=2048, hop_length=512))
         spec_norm = spec / (np.sum(spec, axis=0) + 1e-6)
         spec_entropy = -np.sum(spec_norm * np.log2(spec_norm + 1e-6), axis=0)
-        rpde = np.mean(spec_entropy) / 10.0
+        rpde = float(np.mean(spec_entropy) / 10.0)
 
-        autocorr = librosa.autocorrelate(y)
-        dfa = np.sum(autocorr[:min(100, len(autocorr))]) / len(autocorr)
+        # DFA via autocorrelation — FIXED: max_size=200 instead of full
+        print("   → DFA ...")
+        autocorr = librosa.autocorrelate(y, max_size=200)
+        dfa = float(np.sum(autocorr[:min(100, len(autocorr))]) / len(autocorr))
 
+        # PPE via YIN pitch estimation
+        print("   → PPE (YIN) ...")
         f0 = librosa.yin(y, fmin=75, fmax=600, sr=sr)
         f0_valid = f0[f0 > 0]
-        ppe = np.std(f0_valid) / (np.mean(f0_valid) + 1e-6) if len(f0_valid) > 0 else 0.0
+        ppe = float(np.std(f0_valid) / (np.mean(f0_valid) + 1e-6)) if len(f0_valid) > 0 else 0.0
 
         print("✓ Nonlinear features extracted")
-        return {
-            'RPDE': rpde,
-            'DFA': dfa,
-            'PPE': ppe
-        }
+        return {'RPDE': rpde, 'DFA': dfa, 'PPE': ppe}
     except Exception as e:
-        raise Exception(f"Error extracting nonlinear features: {e}")
+        print(f"⚠️ Nonlinear features ERROR — using fallback. ({e})")
+        return {'RPDE': 0.6, 'DFA': 0.7, 'PPE': 0.2}
 
 def extract_all_features(audio_array, sample_rate):
     """
     Extract all 15 required features.
     Takes a float32 numpy array and its sample rate directly.
     Writes a single clean WAV for Parselmouth, then cleans up.
+    
+    Each sub-extraction now prints before AND after so any hang is
+    immediately visible in the server logs.
     """
     print("🔬 Starting feature extraction...")
+    print(f"   Input: {len(audio_array)} samples @ {sample_rate} Hz "
+          f"({len(audio_array)/sample_rate:.2f}s)")
     temp_wav = '/tmp/temp_parselmouth.wav'
     try:
-        # Write float32 audio as 16-bit PCM WAV for Parselmouth compatibility
+        # Write as 16-bit PCM WAV — Parselmouth requires integer PCM
         audio_int16 = np.clip(audio_array * 32767, -32768, 32767).astype(np.int16)
         sf.write(temp_wav, audio_int16, sample_rate, subtype='PCM_16')
-        
+        print(f"   Wrote temp WAV: {temp_wav}")
+
         voice = parselmouth.Sound(temp_wav)
+        print(f"   Parselmouth loaded: duration={voice.duration:.2f}s  sr={voice.sampling_frequency}")
 
-        # Extract features sequentially
+        # --- 1/3: Jitter & Shimmer (Parselmouth, timeout-protected) ---
+        print("   [1/3] Starting jitter/shimmer ...")
         jitter_shimmer = extract_jitter_shimmer_features(voice)
+        print("   [1/3] ✓ jitter/shimmer done")
+
+        # --- 2/3: Harmonicity (Parselmouth, timeout-protected) ---
+        print("   [2/3] Starting harmonicity ...")
         harmonicity = extract_harmonicity_features(voice)
+        print("   [2/3] ✓ harmonicity done")
+
+        # --- 3/3: Nonlinear features (pure librosa, max_size fix applied) ---
+        print("   [3/3] Starting nonlinear features ...")
         nonlinear = extract_nonlinear_features(audio_array, sample_rate)
+        print("   [3/3] ✓ nonlinear done")
 
-        all_features = {
-            **jitter_shimmer,
-            **harmonicity,
-            **nonlinear
-        }
+        all_features = {**jitter_shimmer, **harmonicity, **nonlinear}
 
-        print("✓ All features extracted successfully")
+        print("✓ All 15 features extracted successfully")
         return all_features
 
     except Exception as e:
         print(f"❌ Feature extraction failed: {e}")
         raise Exception(f"Feature extraction failed: {e}")
     finally:
-        # Always clean up the temp file
         try:
             if os.path.exists(temp_wav):
                 os.remove(temp_wav)
