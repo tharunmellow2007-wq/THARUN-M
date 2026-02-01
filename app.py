@@ -83,22 +83,54 @@ def remove_dc_offset(audio):
     return audio - np.mean(audio)
 
 def bandpass_filter(audio, sr, lowcut, highcut, order=4):
-    """Butterworth Bandpass Filter - FIXED to handle edge cases"""
+    """Butterworth Bandpass Filter - FIXED with comprehensive safety checks"""
     nyquist = 0.5 * sr
+    
+    # Validate inputs
+    if sr <= 0:
+        raise ValueError(f"Invalid sample rate: {sr}")
+    if lowcut <= 0:
+        raise ValueError(f"Invalid lowcut frequency: {lowcut}")
+    if highcut <= 0:
+        raise ValueError(f"Invalid highcut frequency: {highcut}")
+    if lowcut >= highcut:
+        raise ValueError(f"lowcut ({lowcut}) must be < highcut ({highcut})")
+    if highcut >= nyquist:
+        print(f"⚠️ WARNING: highcut ({highcut}) >= Nyquist ({nyquist}), clamping to {nyquist * 0.95}")
+        highcut = nyquist * 0.95
+    
     low = lowcut / nyquist
     high = highcut / nyquist
     
     # Safety check: ensure frequencies are in valid range (0 < Wn < 1)
-    low = max(0.001, min(0.999, low))
-    high = max(0.001, min(0.999, high))
+    # Add margin from boundaries
+    MARGIN = 0.001
+    low = max(MARGIN, min(0.999, low))
+    high = max(MARGIN, min(0.999, high))
     
-    # Ensure low < high
+    # Ensure low < high with safety margin
     if low >= high:
-        low = high * 0.9
+        print(f"⚠️ WARNING: Normalized frequencies too close, adjusting")
+        low = high * 0.8  # Ensure at least 20% separation
     
-    b, a = butter(order, [low, high], btype='band')
-    filtered_audio = signal.filtfilt(b, a, audio)
-    return filtered_audio
+    # Final validation
+    if not (0 < low < 1):
+        raise ValueError(f"Normalized low frequency {low} out of range after safety checks")
+    if not (0 < high < 1):
+        raise ValueError(f"Normalized high frequency {high} out of range after safety checks")
+    if low >= high:
+        raise ValueError(f"Normalized low ({low}) >= high ({high}) after safety checks")
+    
+    try:
+        b, a = butter(order, [low, high], btype='band')
+        filtered_audio = signal.filtfilt(b, a, audio)
+        return filtered_audio
+    except Exception as e:
+        print(f"❌ Butter filter failed:")
+        print(f"   sr={sr}, nyquist={nyquist}")
+        print(f"   lowcut={lowcut}, highcut={highcut}")
+        print(f"   normalized: low={low}, high={high}")
+        raise ValueError(f"Bandpass filter error: {e}")
 
 def estimate_noise_profile(audio, sr, noise_duration=0.5):
     """Estimate noise characteristics from initial portion"""
@@ -169,28 +201,51 @@ def trim_silence(audio, sr, top_db=20):
     trimmed_audio = np.concatenate(trimmed_audio)
     return trimmed_audio, intervals
 
-def preprocess_parkinsons_audio(audio_data, sr,
+def preprocess_parkinsons_audio(audio_path=None, audio_data=None, sr=None,
                                 noise_reduction_strength='medium',
                                 preserve_parkinsons_features=True):
     """
     Comprehensive audio preprocessing for Parkinson's voice analysis.
-    
-    FIXED VERSION - Uses 16kHz to match working Colab code
+    Matches Colab version - accepts either audio_path or (audio_data, sr) tuple
     """
     print("🎵 Preprocessing audio...")
     
-    y = audio_data.copy().astype(np.float32)
+    # Handle both input methods
+    if audio_path:
+        y, original_sr = librosa.load(audio_path, sr=None, mono=True)
+    elif audio_data is not None:
+        if isinstance(audio_data, tuple):
+            # audio_data is (array, sample_rate) tuple
+            y, original_sr = audio_data
+        else:
+            # audio_data is just the array, sr must be provided
+            y = audio_data
+            original_sr = sr if sr else 16000
+    else:
+        raise ValueError("Either audio_path or audio_data must be provided")
+    
+    y = y.astype(np.float32)
 
-    # --- RESAMPLE TO 16 kHz (matches working Colab version) ---
-    TARGET_SR = 16000
-    if sr != TARGET_SR:
-        print(f"   Resampling {sr} → {TARGET_SR} Hz ...")
-        y = librosa.resample(y, orig_sr=sr, target_sr=TARGET_SR)
-    target_sr = TARGET_SR
+    # Target sample rate
+    target_sr = sr if sr else 16000
+    if original_sr != target_sr:
+        print(f"   Resampling {original_sr} → {target_sr} Hz ...")
+        y = librosa.resample(y, orig_sr=original_sr, target_sr=target_sr)
+    
+    # Store original length before spectral subtraction
+    original_length = len(y)
 
     y = remove_dc_offset(y)
     noise_profile = estimate_noise_profile(y, target_sr)
     y = spectral_subtraction(y, target_sr, noise_profile, strength=noise_reduction_strength)
+    
+    # CRITICAL FIX: istft can change array length slightly
+    if len(y) != original_length:
+        print(f"   ⚠️ istft changed length: {original_length} → {len(y)}")
+        if len(y) > original_length:
+            y = y[:original_length]
+        else:
+            y = np.pad(y, (0, original_length - len(y)))
 
     # At 16kHz Nyquist=8000, safe filter frequencies
     if preserve_parkinsons_features:
@@ -203,7 +258,7 @@ def preprocess_parkinsons_audio(audio_data, sr,
     y, intervals = trim_silence(y, target_sr, top_db=20)
 
     # --- HARD CAP at 5 seconds ---
-    MAX_SAMPLES = TARGET_SR * 5  # 80,000 samples
+    MAX_SAMPLES = target_sr * 5
     if len(y) > MAX_SAMPLES:
         print(f"   Capping audio: {len(y)} → {MAX_SAMPLES} samples (5 s)")
         y = y[:MAX_SAMPLES]
@@ -766,8 +821,8 @@ def detect_disease(audio_input, noise_reduction):
         # --- 3. Preprocess -----------------------------------------------------
         print("🔧 Preprocessing...")
         processed_audio, sample_rate, quality_metrics = preprocess_parkinsons_audio(
-            audio_data=audio_array,
-            sr=sr,
+            audio_data=(audio_array, sr),
+            sr=None,  # Will use 16000 as default
             noise_reduction_strength=noise_reduction,
             preserve_parkinsons_features=True
         )
